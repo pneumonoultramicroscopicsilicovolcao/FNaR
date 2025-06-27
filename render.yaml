@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: fnar-backend
+    buildCommand: |
+      pip install -r backend/requirements.txt  # 👈 Correct path
+    startCommand: |
+      cd backend && gunicorn -k eventlet -w 1 app:app
