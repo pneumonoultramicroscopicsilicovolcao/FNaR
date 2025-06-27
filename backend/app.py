@@ -1,32 +1,31 @@
 import os
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 from flask_mysqldb import MySQL
 import jwt
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-def create_app():
-    # Initialize
-    load_dotenv()  # Load .env file
+# Initialize environment variables
+load_dotenv()
 
-    app = Flask(__name__)
-    app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+# Create Flask app
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 
-    # ===== MySQL Configuration =====
-    app.config['MYSQL_HOST'] = os.getenv('MYSQL_HOST', 'localhost')
-    app.config['MYSQL_USER'] = os.getenv('MYSQL_USER', 'fnar_user')
-    app.config['MYSQL_PASSWORD'] = os.getenv('MYSQL_PASSWORD')
-    app.config['MYSQL_DB'] = os.getenv('MYSQL_DB', 'fnar_game')
-    app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
-    mysql = MySQL(app)
+# MySQL Configuration
+app.config['MYSQL_HOST'] = os.getenv('MYSQL_HOST', 'localhost')
+app.config['MYSQL_USER'] = os.getenv('MYSQL_USER', 'fnar_user')
+app.config['MYSQL_PASSWORD'] = os.getenv('MYSQL_PASSWORD')
+app.config['MYSQL_DB'] = os.getenv('MYSQL_DB', 'fnar_game')
+app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
+mysql = MySQL(app)
 
-    # ===== Socket.IO Setup with gevent =====
-    socketio = SocketIO(app,
-                       cors_allowed_origins=os.getenv('FRONTEND_URL', 'http://localhost:5500'),
-                       async_mode='gevent',
-                       logger=True)
-
+# Socket.IO Configuration
+socketio = SocketIO(app,
+                   cors_allowed_origins=os.getenv('FRONTEND_URL', 'http://localhost:5500'),
+                   async_mode='gevent',
+                   logger=True)
 
 # ===== Database Models =====
 def init_db():
@@ -64,13 +63,9 @@ def create_token(player_id):
 
 # ===== Socket.IO Events =====
 @socketio.on('connect')
-    def handle_connect():
-        print(f"Client connected: {request.sid}"
-        init_db()
-        return app, socketio
-
-# Create app and socketio objects for wsgi
-app, socketio = create_app()
+def handle_connect():
+    print(f"Client connected: {request.sid}")
+    init_db()
 
 @socketio.on('authenticate')
 def handle_auth(data):
