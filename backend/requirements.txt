@@ -9,8 +9,8 @@ eventlet==0.33.0
 gunicorn==20.1.0
 
 # Database (Optional)
-psycopg2-binary==2.9.3
-flask-sqlalchemy==2.5.1
+mysql-connector-python==8.0.32
+python-dotenv==0.19.2
 
 # Security
 pyjwt==2.3.0
