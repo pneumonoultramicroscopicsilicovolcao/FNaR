@@ -1,193 +1,218 @@
 import os
-from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit, join_room, disconnect
-from game_state import GameState
 import eventlet
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, disconnect
+import mysql.connector
 from datetime import datetime
+from dotenv import load_dotenv
 
-# Required for WebSocket support on Render
+# Initialize
 eventlet.monkey_patch()
+load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev_secret_123')
 
-# Configure Socket.IO with CORS and async mode
-socketio = SocketIO(app,
+# MySQL Configuration
+def get_db():
+    return mysql.connector.connect(
+        host=os.getenv('DB_HOST', 'localhost'),
+        user=os.getenv('DB_USER', 'fnar_user'),
+        password=os.getenv('DB_PASSWORD'),
+        database=os.getenv('DB_NAME', 'fnar_game')
+    )
+
+socketio = SocketIO(app, 
                    cors_allowed_origins="*",
                    async_mode='eventlet',
                    logger=True,
                    engineio_logger=True)
 
+# Game State
+class GameState:
+    def __init__(self):
+        self.players = {}
+        self.admin_sid = None
+        self.game_active = False
+        self.current_night = 1
+        self.energy = 100
+        self.start_time = None
+        self.doors = {'left': False, 'right': False}
+        self.animatronics = {
+            'arseny': {'position': 'vent', 'visible': False},
+            'iskander': {'position': 'room1', 'visible': False}
+        }
+
 game_state = GameState()
 
-# --------------------------
-# Authentication Endpoints
-# --------------------------
+# Database Operations
+def log_player(sid, name, role):
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+            INSERT INTO players (id, username, role, last_active)
+            VALUES (%s, %s, %s, NOW())
+            ON DUPLICATE KEY UPDATE last_active=NOW()
+        """, (sid, name, role))
+        db.commit()
+    except Exception as e:
+        print(f"Database error: {e}")
 
-@app.route('/api/health')
-def health_check():
-    return jsonify({
-        "status": "online",
-        "time": datetime.now().isoformat(),
-        "players": len(game_state.players)
-    })
-
+# Socket.IO Events
 @socketio.on('connect')
 def handle_connect():
-    print(f"New connection: {request.sid}")
+    print(f"Client connected: {request.sid}")
 
 @socketio.on('authenticate')
 def handle_auth(data):
     role = data.get('role')
-    name = data.get('name', 'Anonymous')
-    password = data.get('password', '')
-
-    # Admin authentication
+    name = data.get('name', f"Player_{request.sid[:4]}")
+    
+    # Admin verification
     if role == 'admin':
-        if password != os.getenv('ADMIN_PASSWORD'):
-            emit('auth_response', {
-                "success": False,
-                "message": "Invalid admin password"
-            })
+        if data.get('password') != os.getenv('ADMIN_PASSWORD'):
+            emit('auth_response', {'success': False, 'message': 'Invalid admin password'})
             disconnect()
             return
-
-        game_state.set_admin(request.sid)
-        emit('auth_response', {
-            "success": True,
-            "role": "admin",
-            "is_admin": True
-        })
-        emit('admin_update', {
-            "players": game_state.get_player_list(),
-            "game_active": game_state.game_active
-        }, room=request.sid)
-        return
-
-    # Player authentication
-    if game_state.game_active:
-        emit('auth_response', {
-            "success": False,
-            "message": "Game already in progress"
-        })
-        disconnect()
-        return
-
-    game_state.add_player(request.sid, role, name)
+        game_state.admin_sid = request.sid
+    
+    # Register player
+    game_state.players[request.sid] = {'name': name, 'role': role}
+    log_player(request.sid, name, role)
+    
     emit('auth_response', {
-        "success": True,
-        "role": role,
-        "is_admin": False
+        'success': True,
+        'role': role,
+        'is_admin': (role == 'admin')
     })
+    
+    # Broadcast player join
     emit('player_joined', {
-        "id": request.sid,
-        "name": name,
-        "role": role
+        'id': request.sid,
+        'name': name,
+        'role': role
     }, broadcast=True)
-
-# --------------------------
-# Game Control Endpoints
-# --------------------------
-
-@socketio.on('start_game')
-def handle_start_game():
-    if not game_state.is_admin(request.sid):
-        emit('error', {"message": "Admin privileges required"})
-        return
-
+    
+    # Send initial game state
     if game_state.game_active:
-        emit('error', {"message": "Game already running"})
-        return
-
-    game_state.start_game()
-    emit('game_started', {
-        "night": game_state.current_night,
-        "energy": game_state.energy
-    }, broadcast=True)
-
-@socketio.on('end_game')
-def handle_end_game():
-    if not game_state.is_admin(request.sid):
-        emit('error', {"message": "Admin privileges required"})
-        return
-
-    game_state.end_game()
-    emit('game_ended', broadcast=True)
-
-# --------------------------
-# Player Actions
-# --------------------------
+        emit('game_state_update', {
+            'energy': game_state.energy,
+            'night': game_state.current_night,
+            'doors': game_state.doors
+        })
 
 @socketio.on('door_action')
 def handle_door(data):
-    if not game_state.validate_player(request.sid):
-        disconnect()
+    if request.sid not in game_state.players:
         return
-
+    
     side = data.get('side')
     action = data.get('action')
-    game_state.update_door(side, action)
-    emit('door_update', data, broadcast=True)
+    
+    if side in game_state.doors:
+        game_state.doors[side] = (action == 'open')
+        emit('door_update', {
+            'side': side,
+            'state': game_state.doors[side]
+        }, broadcast=True)
+        
+        # Log to database
+        try:
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("""
+                INSERT INTO door_events (player_id, door_side, action)
+                VALUES (%s, %s, %s)
+            """, (request.sid, side, action))
+            db.commit()
+        except Exception as e:
+            print(f"Door log error: {e}")
 
 @socketio.on('animatronic_move')
 def handle_anim_move(data):
-    player = game_state.get_player(request.sid)
-    if not player or player['role'] != 'animatronic':
+    if (request.sid not in game_state.players or 
+        game_state.players[request.sid]['role'] != 'animatronic'):
         return
-
-    if game_state.validate_move(data):
+    
+    anim_type = data.get('type')
+    if anim_type in game_state.animatronics:
+        game_state.animatronics[anim_type] = {
+            'position': data.get('position'),
+            'visible': data.get('visible', False)
+        }
+        
         emit('animatronic_update', {
-            "type": data['type'],
-            "location": data['location'],
-            "player_id": request.sid
+            'type': anim_type,
+            'position': data.get('position'),
+            'visible': data.get('visible'),
+            'x': data.get('x', 50),
+            'y': data.get('y', 50)
         }, broadcast=True)
 
-# --------------------------
-# Admin Controls
-# --------------------------
-
-@socketio.on('request_player_list')
-def handle_player_list_request():
-    if game_state.is_admin(request.sid):
-        emit('player_list_update', {
-            "players": game_state.get_player_list(),
-            "game_active": game_state.game_active
-        })
-
-@socketio.on('kick_player')
-def handle_kick_player(data):
-    if not game_state.is_admin(request.sid):
+@socketio.on('admin_start_game')
+def handle_start_game():
+    if request.sid != game_state.admin_sid:
+        emit('error', {'message': 'Admin privileges required'})
         return
+    
+    game_state.game_active = True
+    game_state.start_time = datetime.now()
+    
+    emit('game_started', {
+        'night': game_state.current_night,
+        'energy': game_state.energy
+    }, broadcast=True)
+    
+    # Log game start
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+            INSERT INTO game_sessions (start_time, night_number)
+            VALUES (NOW(), %s)
+        """, (game_state.current_night,))
+        db.commit()
+    except Exception as e:
+        print(f"Game start log error: {e}")
 
-    player_id = data.get('player_id')
-    if player_id in game_state.players:
-        emit('kicked', {}, room=player_id)
-        disconnect(player_id)
-
-# --------------------------
-# Connection Cleanup
-# --------------------------
+@socketio.on('request_admin_data')
+def handle_admin_data():
+    if request.sid == game_state.admin_sid:
+        emit('admin_update', {
+            'players': [
+                {'id': sid, 'name': p['name'], 'role': p['role']}
+                for sid, p in game_state.players.items()
+            ],
+            'game_active': game_state.game_active,
+            'night': game_state.current_night,
+            'energy': game_state.energy
+        })
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    player = game_state.remove_player(request.sid)
-    if player:
+    if request.sid in game_state.players:
+        player = game_state.players.pop(request.sid)
         emit('player_left', {
-            "id": request.sid,
-            "name": player['name'],
-            "role": player['role']
+            'id': request.sid,
+            'name': player['name']
         }, broadcast=True)
+        
+        if request.sid == game_state.admin_sid:
+            game_state.admin_sid = None
 
-    if game_state.is_admin(request.sid):
-        game_state.admin_sid = None
-
-# --------------------------
-# Main Execution
-# --------------------------
+# Health Check Endpoint
+@app.route('/health')
+def health_check():
+    return {
+        'status': 'online',
+        'players': len(game_state.players),
+        'game_active': game_state.game_active
+    }
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 10000))
-    socketio.run(app,
-                host='0.0.0.0',
-                port=port,
-                debug=os.getenv('DEBUG', 'false').lower() == 'true')
+    socketio.run(app, 
+                 host='0.0.0.0', 
+                 port=port,
+                 debug=os.getenv('DEBUG', 'false').lower() == 'true')
